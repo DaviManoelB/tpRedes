@@ -1,4 +1,6 @@
 import javax.swing.*;
+import javax.swing.border.TitledBorder;
+import javax.swing.text.BadLocationException;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -7,54 +9,79 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.concurrent.ExecutorService;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Cliente Swing (executar no PC1).
+ * Cliente Swing (executar no PC1; pode abrir varias instancias).
  *
- * - TCP: conecta ao servidor, mantem a conexao aberta e usa uma thread
- *        dedicada para ler as respostas sem travar a interface.
- * - UDP: cada envio roda em uma thread propria, mede o RTT e trata timeout
- *        (UDP nao garante entrega).
- *
- * IP/portas padrao: o IP do roteador R1 (ponto de entrada do redirecionamento)
- * e as portas TCP/UDP configuradas no port forwarding.
+ * - TCP -> CHAT: conexao confiavel; uma thread fica lendo as mensagens dos outros.
+ * - UDP -> PING + STATUS ONLINE: a cada 1 s envia um PING; o servidor responde PONG com a
+ *          lista de quem esta online. O cliente calcula RTT e % de perda (timeout de 2 s).
+ *          Um ping perdido nao e reenviado: o proximo ja traz a informacao atualizada.
  */
 public class Cliente extends JFrame {
 
-   // Valores iniciais; podem ser editados na tela
    private static final String IP_PADRAO = "192.168.0.1";
    private static final int PORTA_TCP_PADRAO = 6789;
    private static final int PORTA_UDP_PADRAO = 9871;
-   private static final int TIMEOUT_UDP_MS = 3000;
+   private static final int INTERVALO_PING_MS = 1000;
+   private static final int TIMEOUT_PING_MS = 2000;
+   private static final int MAX_LINHAS_LOG = 500;
 
-   // Componentes Swing
-   private final JTextField campoIp = new JTextField(IP_PADRAO, 12);
+   // ---- Swing
+   private final JTextField campoIp = new JTextField(IP_PADRAO, 11);
    private final JTextField campoPortaTcp = new JTextField(String.valueOf(PORTA_TCP_PADRAO), 5);
    private final JTextField campoPortaUdp = new JTextField(String.valueOf(PORTA_UDP_PADRAO), 5);
-   private final JButton botaoConectar = new JButton("Conectar TCP");
-   private final JButton botaoDesconectar = new JButton("Desconectar");
+   private final JTextField campoNome = new JTextField("Cliente" + (100 + new Random().nextInt(900)), 9);
+   private final JButton botaoConectarTcp = new JButton("Conectar chat (TCP)");
+   private final JButton botaoDesconectarTcp = new JButton("Desconectar");
+   private final JButton botaoIniciarUdp = new JButton("Iniciar ping (UDP)");
+   private final JButton botaoPararUdp = new JButton("Parar ping");
    private final JTextField campoMensagem = new JTextField();
-   private final JButton botaoEnviarTcp = new JButton("Enviar TCP");
-   private final JButton botaoEnviarUdp = new JButton("Enviar UDP");
-   private final JTextArea areaLog = new JTextArea();
-   private final JLabel status = new JLabel("TCP: desconectado");
+   private final JButton botaoEnviarTcp = new JButton("Enviar");
+   private final JTextArea areaChat = new JTextArea();
+   private final JTextArea areaUdp = new JTextArea();
+   private final DefaultListModel<String> modeloOnline = new DefaultListModel<>();
+   private final JLabel lblStats = new JLabel();
+   private final JLabel status = new JLabel();
 
-   // Estado da conexao TCP
-   private Socket socketTcp;
-   private OutputStream saidaTcp;
-   // Uma unica thread para as escritas TCP garante a ordem das mensagens
-   private final ExecutorService escritorTcp = Executors.newSingleThreadExecutor(r -> {
-      Thread t = new Thread(r, "Cliente-TCP-escrita");
+   // ---- TCP
+   private volatile Socket socketTcp;
+   private volatile OutputStream saidaTcp;
+   private volatile boolean tcpAtivo = false;
+
+   // ---- UDP
+   private volatile DatagramSocket socketUdp;
+   private volatile InetAddress ipServidorUdp;
+   private volatile int portaServidorUdp;
+   private volatile String nomeUdp = "";
+   private ScheduledFuture<?> tarefaPing;
+   private final AtomicLong seqUdp = new AtomicLong();
+   private final ConcurrentHashMap<Long, Long> pendentes = new ConcurrentHashMap<>(); // seq -> nanoTime
+
+   // Estatisticas do ping (acessar sempre com synchronized(this.stats))
+   private final Object stats = new Object();
+   private int enviados, recebidos, perdidos;
+   private double rttUltimo, rttSoma, rttMin, rttMax;
+
+   // Thread unica: escritas TCP (ordem garantida), envio dos pings e timeouts
+   private final ScheduledExecutorService agendador = Executors.newSingleThreadScheduledExecutor(r -> {
+      Thread t = new Thread(r, "Cliente-escrita");
       t.setDaemon(true);
       return t;
    });
 
    public Cliente() {
-      super("Cliente de Rede - TCP e UDP");
+      super("Chat TCP + Ping/Status UDP");
       montarInterface();
-      atualizarBotoes(false);
+      atualizarEstado();
+      atualizarEstatisticas();
    }
 
    // ------------------------------------------------------------ interface
@@ -63,217 +90,348 @@ public class Cliente extends JFrame {
       addWindowListener(new WindowAdapter() {
          @Override
          public void windowClosing(WindowEvent e) {
-            fecharTcp();
-            dispose();
-            System.exit(0);
+            pararUdp();
+            desconectarTcp();
+            Timer t = new Timer(400, ev -> System.exit(0)); // tempo para enviar SAIR
+            t.setRepeats(false);
+            t.start();
          }
       });
 
-      // Topo: configuracao do servidor
-      JPanel topo = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
-      topo.add(new JLabel("IP:"));
-      topo.add(campoIp);
-      topo.add(new JLabel("Porta TCP:"));
-      topo.add(campoPortaTcp);
-      topo.add(new JLabel("Porta UDP:"));
-      topo.add(campoPortaUdp);
-      topo.add(botaoConectar);
-      topo.add(botaoDesconectar);
+      JPanel linha1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+      linha1.add(new JLabel("IP:"));
+      linha1.add(campoIp);
+      linha1.add(new JLabel("Porta TCP:"));
+      linha1.add(campoPortaTcp);
+      linha1.add(new JLabel("Porta UDP:"));
+      linha1.add(campoPortaUdp);
+      linha1.add(new JLabel("Nome:"));
+      linha1.add(campoNome);
 
-      // Centro: log
-      areaLog.setEditable(false);
-      areaLog.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
-      JScrollPane rolagem = new JScrollPane(areaLog);
+      JPanel linha2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+      linha2.add(botaoConectarTcp);
+      linha2.add(botaoDesconectarTcp);
+      linha2.add(Box.createHorizontalStrut(20));
+      linha2.add(botaoIniciarUdp);
+      linha2.add(botaoPararUdp);
 
-      // Rodape: mensagem + botoes
+      JPanel topo = new JPanel(new GridLayout(2, 1));
+      topo.add(linha1);
+      topo.add(linha2);
+
+      Font mono = new Font(Font.MONOSPACED, Font.PLAIN, 13);
+      areaChat.setEditable(false);
+      areaChat.setFont(mono);
+      areaUdp.setEditable(false);
+      areaUdp.setFont(mono);
+      JScrollPane rolagemChat = new JScrollPane(areaChat);
+      rolagemChat.setBorder(new TitledBorder("Chat (TCP)"));
+      JScrollPane rolagemUdp = new JScrollPane(areaUdp);
+      rolagemUdp.setBorder(new TitledBorder("Monitor de ping (UDP)"));
+      JSplitPane centro = new JSplitPane(JSplitPane.VERTICAL_SPLIT, rolagemChat, rolagemUdp);
+      centro.setResizeWeight(0.6);
+
+      // Painel lateral: quem esta online + estatisticas
+      JList<String> listaOnline = new JList<>(modeloOnline);
+      JScrollPane rolagemOnline = new JScrollPane(listaOnline);
+      rolagemOnline.setBorder(new TitledBorder("Online (UDP)"));
+      lblStats.setBorder(new TitledBorder("Estatisticas"));
+      JPanel lateral = new JPanel(new BorderLayout());
+      lateral.setPreferredSize(new Dimension(200, 0));
+      lateral.add(rolagemOnline, BorderLayout.CENTER);
+      lateral.add(lblStats, BorderLayout.SOUTH);
+
       JPanel envio = new JPanel(new BorderLayout(6, 6));
       envio.add(new JLabel("Mensagem:"), BorderLayout.WEST);
       envio.add(campoMensagem, BorderLayout.CENTER);
-      JPanel botoes = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
-      botoes.add(botaoEnviarTcp);
-      botoes.add(botaoEnviarUdp);
-      envio.add(botoes, BorderLayout.EAST);
-
+      envio.add(botaoEnviarTcp, BorderLayout.EAST);
       JPanel rodape = new JPanel(new BorderLayout(0, 4));
       rodape.add(envio, BorderLayout.CENTER);
       rodape.add(status, BorderLayout.SOUTH);
       rodape.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
 
       add(topo, BorderLayout.NORTH);
-      add(rolagem, BorderLayout.CENTER);
+      add(centro, BorderLayout.CENTER);
+      add(lateral, BorderLayout.EAST);
       add(rodape, BorderLayout.SOUTH);
 
-      // Eventos
-      botaoConectar.addActionListener(e -> conectarTcp());
-      botaoDesconectar.addActionListener(e -> desconectarTcp());
+      botaoConectarTcp.addActionListener(e -> conectarTcp());
+      botaoDesconectarTcp.addActionListener(e -> desconectarTcp());
+      botaoIniciarUdp.addActionListener(e -> iniciarUdp());
+      botaoPararUdp.addActionListener(e -> pararUdp());
       botaoEnviarTcp.addActionListener(e -> enviarTcp());
-      botaoEnviarUdp.addActionListener(e -> enviarUdp());
-      campoMensagem.addActionListener(e -> {
-         // Enter envia por TCP se conectado; senao, por UDP
-         if (botaoEnviarTcp.isEnabled()) enviarTcp(); else enviarUdp();
-      });
+      campoMensagem.addActionListener(e -> enviarTcp());
 
-      setSize(720, 480);
+      setSize(900, 560);
       setLocationRelativeTo(null);
    }
 
-   private void atualizarBotoes(boolean conectado) {
-      botaoConectar.setEnabled(!conectado);
-      botaoDesconectar.setEnabled(conectado);
-      botaoEnviarTcp.setEnabled(conectado);
-      campoIp.setEnabled(!conectado);
-      campoPortaTcp.setEnabled(!conectado);
-      status.setText(conectado ? "TCP: conectado a " + campoIp.getText().trim() + ":"
-            + campoPortaTcp.getText().trim() : "TCP: desconectado");
-   }
-
-   /** Escreve no log a partir de qualquer thread (sempre via Event Dispatch Thread). */
-   private void log(String proto, String msg) {
-      String hora = new SimpleDateFormat("HH:mm:ss.SSS").format(new Date());
+   /** Atualiza botoes e status. Pode ser chamado de qualquer thread. */
+   private void atualizarEstado() {
       SwingUtilities.invokeLater(() -> {
-         areaLog.append("[" + hora + "] [" + proto + "] " + msg + "\n");
-         areaLog.setCaretPosition(areaLog.getDocument().getLength());
+         boolean udpAtivo = socketUdp != null;
+         botaoConectarTcp.setEnabled(!tcpAtivo);
+         botaoDesconectarTcp.setEnabled(tcpAtivo);
+         botaoEnviarTcp.setEnabled(tcpAtivo);
+         botaoIniciarUdp.setEnabled(!udpAtivo);
+         botaoPararUdp.setEnabled(udpAtivo);
+         campoIp.setEnabled(!tcpAtivo && !udpAtivo);
+         campoPortaTcp.setEnabled(!tcpAtivo);
+         campoPortaUdp.setEnabled(!udpAtivo);
+         campoNome.setEnabled(!tcpAtivo && !udpAtivo);
+         status.setText("Chat TCP: " + (tcpAtivo ? "conectado" : "desconectado")
+               + "   |   Ping UDP: " + (udpAtivo ? "ativo" : "parado"));
       });
    }
 
-   // ------------------------------------------------------------------ TCP
+   private void atualizarEstatisticas() {
+      final String html;
+      synchronized (stats) {
+         int total = recebidos + perdidos;
+         double perda = total == 0 ? 0 : 100.0 * perdidos / total;
+         double media = recebidos == 0 ? 0 : rttSoma / recebidos;
+         html = String.format("<html>Enviados: %d<br>Recebidos: %d<br>Perdidos: %d (%.1f%%)<br>"
+                     + "RTT ultimo: %.2f ms<br>RTT medio: %.2f ms<br>RTT min/max: %.2f / %.2f ms</html>",
+               enviados, recebidos, perdidos, perda, rttUltimo, media,
+               recebidos == 0 ? 0 : rttMin, rttMax);
+      }
+      SwingUtilities.invokeLater(() -> lblStats.setText(html));
+   }
+
+   /** Escreve em uma area de texto a partir de qualquer thread. */
+   private void escrever(JTextArea area, String msg) {
+      String hora = new SimpleDateFormat("HH:mm:ss.SSS").format(new Date());
+      SwingUtilities.invokeLater(() -> {
+         area.append("[" + hora + "] " + msg + "\n");
+         try { // evita o log crescer sem limite (ping gera 1 linha por segundo)
+            if (area.getLineCount() > MAX_LINHAS_LOG) {
+               area.replaceRange("", 0, area.getLineEndOffset(99));
+            }
+         } catch (BadLocationException ignorado) {
+            // nada a fazer
+         }
+         area.setCaretPosition(area.getDocument().getLength());
+      });
+   }
+
+   private void logChat(String msg) { escrever(areaChat, msg); }
+   private void logUdp(String msg) { escrever(areaUdp, msg); }
+
+   private String nomeDigitado() {
+      String n = campoNome.getText().replaceAll("[|,\\r\\n]", "_").trim();
+      return n.isEmpty() ? "anonimo" : n;
+   }
+
+   // ------------------------------------------------------------------ TCP (chat)
    private void conectarTcp() {
       final String ip = campoIp.getText().trim();
+      final String nome = nomeDigitado();
       final int porta;
       try {
          porta = Integer.parseInt(campoPortaTcp.getText().trim());
       } catch (NumberFormatException ex) {
-         log("TCP", "Porta TCP invalida.");
+         logChat("Porta TCP invalida.");
          return;
       }
-      botaoConectar.setEnabled(false);
-      log("TCP", "Conectando a " + ip + ":" + porta + " ...");
+      botaoConectarTcp.setEnabled(false);
+      logChat("Conectando a " + ip + ":" + porta + " ...");
 
-      // Conectar pode demorar: nao pode rodar na thread da interface
       new Thread(() -> {
          try {
-            // Primitivas socket + connect (three-way handshake)
             Socket s = new Socket();
-            s.connect(new InetSocketAddress(ip, porta), 5000);
+            s.connect(new InetSocketAddress(ip, porta), 5000); // socket + connect
             socketTcp = s;
             saidaTcp = s.getOutputStream();
-            log("TCP", "Conectado. Local: " + s.getLocalSocketAddress()
-                  + " -> Servidor: " + s.getRemoteSocketAddress());
-            SwingUtilities.invokeLater(() -> atualizarBotoes(true));
+            tcpAtivo = true;
+            atualizarEstado();
+            logChat("Conectado. Local " + s.getLocalSocketAddress()
+                  + " -> Servidor " + s.getRemoteSocketAddress());
 
-            // Esta thread passa a ser o "ouvinte" das respostas do servidor
-            lerRespostasTcp(s);
+            // Primeira linha: identifica o cliente para o servidor
+            saidaTcp.write(("NOME|" + nome + "\n").getBytes(StandardCharsets.UTF_8));
+            saidaTcp.flush();
+
+            lerMensagensTcp(s); // esta thread passa a ser o ouvinte do chat
          } catch (IOException ex) {
-            log("TCP", "Falha ao conectar: " + ex.getMessage());
-            SwingUtilities.invokeLater(() -> atualizarBotoes(false));
+            logChat("Falha ao conectar: " + ex.getMessage());
+            atualizarEstado();
          }
       }, "Cliente-TCP-leitura").start();
    }
 
-   private void lerRespostasTcp(Socket s) {
+   private void lerMensagensTcp(Socket s) {
       try (BufferedReader entrada = new BufferedReader(
             new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))) {
          String linha;
          while ((linha = entrada.readLine()) != null) {
-            log("TCP", "FROM SERVER: " + linha);
+            logChat(linha);
          }
-         log("TCP", "Servidor encerrou a conexao.");
+         logChat("Servidor encerrou a conexao.");
       } catch (IOException ex) {
-         if (!s.isClosed()) log("TCP", "Conexao interrompida: " + ex.getMessage());
+         if (!s.isClosed()) logChat("Conexao interrompida: " + ex.getMessage());
       } finally {
          fecharTcp();
-         SwingUtilities.invokeLater(() -> atualizarBotoes(false));
       }
    }
 
    private void enviarTcp() {
       final String msg = campoMensagem.getText();
-      if (msg.isEmpty() || saidaTcp == null) return;
-      campoMensagem.setText("");
       final OutputStream saida = saidaTcp;
-
-      escritorTcp.submit(() -> {
+      if (msg.isEmpty() || saida == null) return;
+      campoMensagem.setText("");
+      agendador.execute(() -> {
          try {
-            // Primitiva send: mensagem terminada em \n (o servidor usa readLine)
-            saida.write((msg + "\n").getBytes(StandardCharsets.UTF_8));
+            saida.write((msg + "\n").getBytes(StandardCharsets.UTF_8)); // send
             saida.flush();
-            log("TCP", "ENVIADO: " + msg);
+            logChat("Eu: " + msg);
          } catch (IOException ex) {
-            log("TCP", "Erro ao enviar: " + ex.getMessage());
+            logChat("Erro ao enviar: " + ex.getMessage());
          }
       });
    }
 
    private void desconectarTcp() {
-      escritorTcp.submit(() -> {
+      final OutputStream saida = saidaTcp;
+      agendador.execute(() -> {
          try {
-            if (saidaTcp != null) {
-               saidaTcp.write("SAIR\n".getBytes(StandardCharsets.UTF_8));
-               saidaTcp.flush();
+            if (saida != null) {
+               saida.write("SAIR\n".getBytes(StandardCharsets.UTF_8));
+               saida.flush();
             }
          } catch (IOException ignorado) {
-            // a conexao pode ja estar fechada
+            // conexao ja fechada
          }
          fecharTcp();
-         log("TCP", "Desconectado.");
       });
    }
 
    private synchronized void fecharTcp() {
+      boolean estavaAtivo = tcpAtivo;
       try {
-         if (socketTcp != null && !socketTcp.isClosed()) socketTcp.close(); // primitiva close
+         if (socketTcp != null && !socketTcp.isClosed()) socketTcp.close(); // close
       } catch (IOException ignorado) {
          // nada a fazer
       }
       socketTcp = null;
       saidaTcp = null;
+      tcpAtivo = false;
+      atualizarEstado();
+      if (estavaAtivo) logChat("Desconectado do chat.");
    }
 
-   // ------------------------------------------------------------------ UDP
-   private void enviarUdp() {
-      final String msg = campoMensagem.getText();
-      if (msg.isEmpty()) return;
+   // ------------------------------------------------------------------ UDP (ping + online)
+   private void iniciarUdp() {
       final String ip = campoIp.getText().trim();
       final int porta;
       try {
          porta = Integer.parseInt(campoPortaUdp.getText().trim());
       } catch (NumberFormatException ex) {
-         log("UDP", "Porta UDP invalida.");
+         logUdp("Porta UDP invalida.");
          return;
       }
-      campoMensagem.setText("");
+      try {
+         ipServidorUdp = InetAddress.getByName(ip);
+         portaServidorUdp = porta;
+         nomeUdp = nomeDigitado();
+         socketUdp = new DatagramSocket(); // socket UDP (sem conexao)
+      } catch (IOException ex) {
+         logUdp("Erro: " + ex.getMessage());
+         return;
+      }
+      synchronized (stats) { // zera estatisticas
+         enviados = recebidos = perdidos = 0;
+         rttUltimo = rttSoma = rttMax = 0;
+         rttMin = Double.MAX_VALUE;
+      }
+      atualizarEstatisticas();
+      atualizarEstado();
 
-      // Cada envio UDP roda em sua propria thread: a interface nunca trava
-      // esperando a resposta (ou o timeout).
-      new Thread(() -> {
-         try (DatagramSocket clientSocket = new DatagramSocket()) {
-            clientSocket.setSoTimeout(TIMEOUT_UDP_MS);
-            InetAddress ipServidor = InetAddress.getByName(ip);
+      final DatagramSocket s = socketUdp;
+      logUdp("Ping iniciado: " + ip + ":" + porta + " (porta local " + s.getLocalPort() + ")");
 
-            byte[] sendData = msg.getBytes(StandardCharsets.UTF_8);
-            DatagramPacket sendPacket =
-                  new DatagramPacket(sendData, sendData.length, ipServidor, porta);
+      new Thread(() -> receberUdp(s), "Cliente-UDP-leitura").start(); // ouvinte de PONGs
+      tarefaPing = agendador.scheduleAtFixedRate(this::enviarPing, 0,
+            INTERVALO_PING_MS, TimeUnit.MILLISECONDS);                 // emissor de PINGs
+   }
 
-            long inicio = System.nanoTime();
-            clientSocket.send(sendPacket);
-            log("UDP", "ENVIADO para " + ip + ":" + porta + " (porta local "
-                  + clientSocket.getLocalPort() + "): " + msg);
+   private void enviarPing() {
+      final DatagramSocket s = socketUdp;
+      if (s == null) return;
+      final long seq = seqUdp.incrementAndGet();
+      try {
+         byte[] dados = ("PING|" + seq + "|" + nomeUdp).getBytes(StandardCharsets.UTF_8);
+         pendentes.put(seq, System.nanoTime());
+         s.send(new DatagramPacket(dados, dados.length, ipServidorUdp, portaServidorUdp));
+         synchronized (stats) { enviados++; }
+         agendador.schedule(() -> verificarTimeout(seq), TIMEOUT_PING_MS, TimeUnit.MILLISECONDS);
+      } catch (IOException ex) {
+         pendentes.remove(seq);
+         logUdp("Erro ao enviar PING: " + ex.getMessage());
+      }
+   }
 
-            byte[] receiveData = new byte[1024];
-            DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
-            clientSocket.receive(receivePacket);
-            double rttMs = (System.nanoTime() - inicio) / 1_000_000.0;
+   private void verificarTimeout(long seq) {
+      if (pendentes.remove(seq) == null) return; // o PONG ja chegou
+      synchronized (stats) { perdidos++; }
+      logUdp("PING #" + seq + " PERDIDO (sem PONG em " + TIMEOUT_PING_MS + " ms)");
+      atualizarEstatisticas();
+   }
 
-            String resposta = new String(receivePacket.getData(), 0,
-                  receivePacket.getLength(), StandardCharsets.UTF_8);
-            log("UDP", String.format("FROM SERVER: %s  (RTT %.2f ms)", resposta, rttMs));
-         } catch (SocketTimeoutException ex) {
-            log("UDP", "Sem resposta em " + TIMEOUT_UDP_MS
-                  + " ms (datagrama perdido ou redirecionamento incorreto).");
-         } catch (IOException ex) {
-            log("UDP", "Erro: " + ex.getMessage());
+   private void receberUdp(DatagramSocket s) {
+      while (!s.isClosed()) {
+         try {
+            byte[] buf = new byte[1024];
+            DatagramPacket pacote = new DatagramPacket(buf, buf.length);
+            s.receive(pacote);
+            String msg = new String(pacote.getData(), 0, pacote.getLength(), StandardCharsets.UTF_8);
+            String[] p = msg.split("\\|", 3); // PONG | seq | lista
+
+            if (!p[0].equals("PONG") || p.length < 3) continue;
+            long seq = Long.parseLong(p[1]);
+            Long inicio = pendentes.remove(seq);
+            if (inicio == null) continue; // PONG atrasado: o ping ja foi contado como perdido
+
+            double rtt = (System.nanoTime() - inicio) / 1_000_000.0;
+            synchronized (stats) {
+               recebidos++;
+               rttUltimo = rtt;
+               rttSoma += rtt;
+               rttMin = Math.min(rttMin, rtt);
+               rttMax = Math.max(rttMax, rtt);
+            }
+            logUdp(String.format("PING #%d  RTT %.2f ms", seq, rtt));
+            atualizarEstatisticas();
+            atualizarOnline(p[2]);
+         } catch (IOException | NumberFormatException ex) {
+            if (!s.isClosed()) logUdp("Erro ao receber: " + ex.getMessage());
          }
-      }, "Cliente-UDP").start();
+      }
+   }
+
+   private void atualizarOnline(String lista) {
+      final String[] nomes = lista.isEmpty() ? new String[0] : lista.split(",");
+      SwingUtilities.invokeLater(() -> {
+         modeloOnline.clear();
+         for (String n : nomes) modeloOnline.addElement(n);
+      });
+   }
+
+   private void pararUdp() {
+      final DatagramSocket s = socketUdp;
+      if (s == null) return;
+      if (tarefaPing != null) tarefaPing.cancel(false);
+      try { // avisa o servidor para nos marcar offline imediatamente
+         byte[] dados = ("SAIR|0|" + nomeUdp).getBytes(StandardCharsets.UTF_8);
+         s.send(new DatagramPacket(dados, dados.length, ipServidorUdp, portaServidorUdp));
+      } catch (IOException ignorado) {
+         // o servidor nos removera por inatividade
+      }
+      socketUdp = null;
+      pendentes.clear();
+      s.close();
+      atualizarOnline("");
+      atualizarEstado();
+      logUdp("Ping parado.");
    }
 
    // ----------------------------------------------------------------- main
