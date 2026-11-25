@@ -6,21 +6,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * Servidor (executar no PC2).
- *
- * - TCP (porta 6789): CHAT. Precisa de entrega confiavel e em ordem, entao usa TCP.
- *     Uma thread por cliente; cada linha recebida e retransmitida aos demais.
- *     Primeira linha do cliente: "NOME|apelido".
- *
- * - UDP (porta 9871): PING + STATUS ONLINE. Sondagens periodicas e tolerantes a perda,
- *     entao usa UDP (nao ha por que retransmitir um ping antigo).
- *       cliente -> servidor:  PING|seq|nome     SAIR|seq|nome
- *       servidor -> cliente:  PONG|seq|nome1,nome2,...   (quem esta online agora)
- *     Quem fica mais de 5 s sem enviar PING e considerado offline.
- *
- * Uso: java Servidor [portaTCP] [portaUDP]
- */
 public class Servidor {
 
    private static final long LIMITE_OFFLINE_MS = 5000;
@@ -31,18 +16,26 @@ public class Servidor {
    // ---- chat (TCP)
    private static final CopyOnWriteArrayList<ClienteTCP> clientesTCP = new CopyOnWriteArrayList<>();
 
-   // ---- presenca (UDP): endereco do cliente -> quem e e quando foi visto pela ultima vez
+   // ---- presenca (UDP): endereco do cliente -> quem e e quando foi visto pela
+   // ultima vez
    private static class Presenca {
       volatile String nome;
       volatile long ultimoVisto;
-      Presenca(String nome) { this.nome = nome; this.ultimoVisto = System.currentTimeMillis(); }
+
+      Presenca(String nome) {
+         this.nome = nome;
+         this.ultimoVisto = System.currentTimeMillis();
+      }
    }
+
    private static final ConcurrentHashMap<SocketAddress, Presenca> online = new ConcurrentHashMap<>();
    private static volatile DatagramSocket socketUDP;
 
    public static void main(String[] args) throws Exception {
-      if (args.length >= 1) portaTCP = Integer.parseInt(args[0]);
-      if (args.length >= 2) portaUDP = Integer.parseInt(args[1]);
+      if (args.length >= 1)
+         portaTCP = Integer.parseInt(args[0]);
+      if (args.length >= 2)
+         portaUDP = Integer.parseInt(args[1]);
 
       mostrarEnderecosLocais();
 
@@ -78,7 +71,8 @@ public class Servidor {
 
    private static void difundir(ClienteTCP origem, String linha) {
       for (ClienteTCP c : clientesTCP) {
-         if (c != origem) c.enviar(linha);
+         if (c != origem)
+            c.enviar(linha);
       }
    }
 
@@ -105,8 +99,8 @@ public class Servidor {
       log("TCP", "Conexao aberta: " + cliente.nome);
 
       try (Socket c = conexao;
-           BufferedReader entrada = new BufferedReader(
-                 new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            BufferedReader entrada = new BufferedReader(
+                  new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
 
          String str;
          boolean primeira = true;
@@ -120,7 +114,8 @@ public class Servidor {
                   continue;
                }
             }
-            if (str.equalsIgnoreCase("SAIR")) break;
+            if (str.equalsIgnoreCase("SAIR"))
+               break;
             log("TCP", "[" + cliente.nome + "] " + str);
             difundir(cliente, "[" + cliente.nome + "] " + str);
          }
@@ -162,7 +157,8 @@ public class Servidor {
       String nome = limpar(p[2]);
 
       if (comando.equals("SAIR")) {
-         if (online.remove(origem) != null) log("UDP", nome + " ficou offline (saiu)");
+         if (online.remove(origem) != null)
+            log("UDP", nome + " ficou offline (saiu)");
          return;
       }
       if (!comando.equals("PING")) {
@@ -180,7 +176,8 @@ public class Servidor {
          pr.ultimoVisto = System.currentTimeMillis();
       }
 
-      // PONG: devolve o mesmo seq (para o cliente medir RTT) + lista de quem esta online
+      // PONG: devolve o mesmo seq (para o cliente medir RTT) + lista de quem esta
+      // online
       byte[] pong = ("PONG|" + seq + "|" + String.join(",", listaOnline()))
             .getBytes(StandardCharsets.UTF_8);
       try {
@@ -192,7 +189,8 @@ public class Servidor {
 
    private static List<String> listaOnline() {
       List<String> nomes = new ArrayList<>();
-      for (Presenca p : online.values()) nomes.add(p.nome);
+      for (Presenca p : online.values())
+         nomes.add(p.nome);
       Collections.sort(nomes);
       return nomes;
    }
@@ -220,7 +218,8 @@ public class Servidor {
    /** Remove caracteres que quebrariam o protocolo. */
    private static String limpar(String nome) {
       String n = nome.replaceAll("[|,\\r\\n]", "_").trim();
-      if (n.length() > 20) n = n.substring(0, 20);
+      if (n.length() > 20)
+         n = n.substring(0, 20);
       return n.isEmpty() ? "anonimo" : n;
    }
 
@@ -228,7 +227,8 @@ public class Servidor {
    private static void mostrarEnderecosLocais() throws SocketException {
       System.out.println("=== Servidor iniciado ===");
       for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-         if (!ni.isUp() || ni.isLoopback()) continue;
+         if (!ni.isUp() || ni.isLoopback())
+            continue;
          for (InetAddress ia : Collections.list(ni.getInetAddresses())) {
             if (ia instanceof Inet4Address) {
                System.out.println("IPSERV candidato: " + ia.getHostAddress()

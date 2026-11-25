@@ -17,14 +17,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Cliente Swing (executar no PC1; pode abrir varias instancias).
- *
- * - TCP -> CHAT: conexao confiavel; uma thread fica lendo as mensagens dos outros.
- * - UDP -> PING + STATUS ONLINE: a cada 1 s envia um PING; o servidor responde PONG com a
- *          lista de quem esta online. O cliente calcula RTT e % de perda (timeout de 2 s).
- *          Um ping perdido nao e reenviado: o proximo ja traz a informacao atualizada.
- */
 public class Cliente extends JFrame {
 
    private static final String IP_PADRAO = "192.168.0.1";
@@ -191,7 +183,7 @@ public class Cliente extends JFrame {
          double perda = total == 0 ? 0 : 100.0 * perdidos / total;
          double media = recebidos == 0 ? 0 : rttSoma / recebidos;
          html = String.format("<html>Enviados: %d<br>Recebidos: %d<br>Perdidos: %d (%.1f%%)<br>"
-                     + "RTT ultimo: %.2f ms<br>RTT medio: %.2f ms<br>RTT min/max: %.2f / %.2f ms</html>",
+               + "RTT ultimo: %.2f ms<br>RTT medio: %.2f ms<br>RTT min/max: %.2f / %.2f ms</html>",
                enviados, recebidos, perdidos, perda, rttUltimo, media,
                recebidos == 0 ? 0 : rttMin, rttMax);
       }
@@ -214,8 +206,13 @@ public class Cliente extends JFrame {
       });
    }
 
-   private void logChat(String msg) { escrever(areaChat, msg); }
-   private void logUdp(String msg) { escrever(areaUdp, msg); }
+   private void logChat(String msg) {
+      escrever(areaChat, msg);
+   }
+
+   private void logUdp(String msg) {
+      escrever(areaUdp, msg);
+   }
 
    private String nomeDigitado() {
       String n = campoNome.getText().replaceAll("[|,\\r\\n]", "_").trim();
@@ -268,7 +265,8 @@ public class Cliente extends JFrame {
          }
          logChat("Servidor encerrou a conexao.");
       } catch (IOException ex) {
-         if (!s.isClosed()) logChat("Conexao interrompida: " + ex.getMessage());
+         if (!s.isClosed())
+            logChat("Conexao interrompida: " + ex.getMessage());
       } finally {
          fecharTcp();
       }
@@ -277,7 +275,8 @@ public class Cliente extends JFrame {
    private void enviarTcp() {
       final String msg = campoMensagem.getText();
       final OutputStream saida = saidaTcp;
-      if (msg.isEmpty() || saida == null) return;
+      if (msg.isEmpty() || saida == null)
+         return;
       campoMensagem.setText("");
       agendador.execute(() -> {
          try {
@@ -308,7 +307,8 @@ public class Cliente extends JFrame {
    private synchronized void fecharTcp() {
       boolean estavaAtivo = tcpAtivo;
       try {
-         if (socketTcp != null && !socketTcp.isClosed()) socketTcp.close(); // close
+         if (socketTcp != null && !socketTcp.isClosed())
+            socketTcp.close(); // close
       } catch (IOException ignorado) {
          // nada a fazer
       }
@@ -316,10 +316,12 @@ public class Cliente extends JFrame {
       saidaTcp = null;
       tcpAtivo = false;
       atualizarEstado();
-      if (estavaAtivo) logChat("Desconectado do chat.");
+      if (estavaAtivo)
+         logChat("Desconectado do chat.");
    }
 
-   // ------------------------------------------------------------------ UDP (ping + online)
+   // ------------------------------------------------------------------ UDP (ping
+   // + online)
    private void iniciarUdp() {
       final String ip = campoIp.getText().trim();
       final int porta;
@@ -351,18 +353,21 @@ public class Cliente extends JFrame {
 
       new Thread(() -> receberUdp(s), "Cliente-UDP-leitura").start(); // ouvinte de PONGs
       tarefaPing = agendador.scheduleAtFixedRate(this::enviarPing, 0,
-            INTERVALO_PING_MS, TimeUnit.MILLISECONDS);                 // emissor de PINGs
+            INTERVALO_PING_MS, TimeUnit.MILLISECONDS); // emissor de PINGs
    }
 
    private void enviarPing() {
       final DatagramSocket s = socketUdp;
-      if (s == null) return;
+      if (s == null)
+         return;
       final long seq = seqUdp.incrementAndGet();
       try {
          byte[] dados = ("PING|" + seq + "|" + nomeUdp).getBytes(StandardCharsets.UTF_8);
          pendentes.put(seq, System.nanoTime());
          s.send(new DatagramPacket(dados, dados.length, ipServidorUdp, portaServidorUdp));
-         synchronized (stats) { enviados++; }
+         synchronized (stats) {
+            enviados++;
+         }
          agendador.schedule(() -> verificarTimeout(seq), TIMEOUT_PING_MS, TimeUnit.MILLISECONDS);
       } catch (IOException ex) {
          pendentes.remove(seq);
@@ -371,8 +376,11 @@ public class Cliente extends JFrame {
    }
 
    private void verificarTimeout(long seq) {
-      if (pendentes.remove(seq) == null) return; // o PONG ja chegou
-      synchronized (stats) { perdidos++; }
+      if (pendentes.remove(seq) == null)
+         return; // o PONG ja chegou
+      synchronized (stats) {
+         perdidos++;
+      }
       logUdp("PING #" + seq + " PERDIDO (sem PONG em " + TIMEOUT_PING_MS + " ms)");
       atualizarEstatisticas();
    }
@@ -386,10 +394,12 @@ public class Cliente extends JFrame {
             String msg = new String(pacote.getData(), 0, pacote.getLength(), StandardCharsets.UTF_8);
             String[] p = msg.split("\\|", 3); // PONG | seq | lista
 
-            if (!p[0].equals("PONG") || p.length < 3) continue;
+            if (!p[0].equals("PONG") || p.length < 3)
+               continue;
             long seq = Long.parseLong(p[1]);
             Long inicio = pendentes.remove(seq);
-            if (inicio == null) continue; // PONG atrasado: o ping ja foi contado como perdido
+            if (inicio == null)
+               continue; // PONG atrasado: o ping ja foi contado como perdido
 
             double rtt = (System.nanoTime() - inicio) / 1_000_000.0;
             synchronized (stats) {
@@ -403,7 +413,8 @@ public class Cliente extends JFrame {
             atualizarEstatisticas();
             atualizarOnline(p[2]);
          } catch (IOException | NumberFormatException ex) {
-            if (!s.isClosed()) logUdp("Erro ao receber: " + ex.getMessage());
+            if (!s.isClosed())
+               logUdp("Erro ao receber: " + ex.getMessage());
          }
       }
    }
@@ -412,14 +423,17 @@ public class Cliente extends JFrame {
       final String[] nomes = lista.isEmpty() ? new String[0] : lista.split(",");
       SwingUtilities.invokeLater(() -> {
          modeloOnline.clear();
-         for (String n : nomes) modeloOnline.addElement(n);
+         for (String n : nomes)
+            modeloOnline.addElement(n);
       });
    }
 
    private void pararUdp() {
       final DatagramSocket s = socketUdp;
-      if (s == null) return;
-      if (tarefaPing != null) tarefaPing.cancel(false);
+      if (s == null)
+         return;
+      if (tarefaPing != null)
+         tarefaPing.cancel(false);
       try { // avisa o servidor para nos marcar offline imediatamente
          byte[] dados = ("SAIR|0|" + nomeUdp).getBytes(StandardCharsets.UTF_8);
          s.send(new DatagramPacket(dados, dados.length, ipServidorUdp, portaServidorUdp));
